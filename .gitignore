@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+work_dirs/
+models/*.onnx
+models/*.pth
+
+# Race data: never commit video or derived files
+data/
+*.mp4
+*.MOV
+*.mov
+*.parquet
+*.annot.mp4
+*.norm.mp4
+*.crop.mp4
