@@ -58,6 +58,7 @@ extend-immutable-calls = [
     "swimtech.smooth.SmoothConfig",
     "swimtech.detect.DetectConfig",
     "swimtech.track.TrackConfig",
+    "swimtech.motion.MotionConfig",
     "swimtech.pose.PoseConfig",
     "swimtech.cycles.CycleConfig",
     "swimtech.findings.FindingThresholds",

@@ -121,6 +121,14 @@ class RacePaths:
         return self._p("probe.json")
 
     @property
+    def motion(self) -> Path:
+        return self._p("motion.parquet")
+
+    @property
+    def water(self) -> Path:
+        return self._p("water.npz")
+
+    @property
     def detections(self) -> Path:
         return self._p("det.parquet")
 

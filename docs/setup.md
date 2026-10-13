@@ -29,7 +29,7 @@ brew install ffmpeg
 sudo apt install ffmpeg
 ```
 
-Open a new terminal afterwards so PATH picks them up. Check:
+Close every terminal (and VS Code) and reopen afterwards so PATH picks them up. Check:
 
 ```
 uv --version
@@ -70,38 +70,52 @@ The API serves a fake race for front-end work before the pipeline exists:
 
 ## 4. Task 1.6: run Stage 1 on one clip
 
-Goal: a crop video that stays on your swimmer. About 30 minutes. CPU is fine.
+Goal: a crop video that stays on your swimmer. About 30 minutes. CPU is fine. The
+camera may be handheld, panning and zooming; the pipeline compensates for that.
 
 1. Install the model dependencies once: `uv sync --extra models`.
 2. Normalize the clip and save its first frame with a pixel grid:
 
    ```
-   uv run swimtech ingest clip.MOV --race-id test1
-   uv run swimtech frame data\test1.norm.mp4 --out first.jpg
+   uv run swimtech ingest C:\Users\you\Downloads\IMG_1234.MOV --race-id race1
+   uv run swimtech frame data\race1.norm.mp4 --out race1_first.jpg
    ```
 
-3. Open `first.jpg`. Read off a box that encloses your swimmer's whole lane for the
-   full race (both walls, a little margin above and below the lane ropes). The grid
-   labels are pixel coordinates. Write it down as `x0,y0,x1,y1` (left, top, right,
-   bottom), for example `120,640,3800,980`.
+3. Open `race1_first.jpg`. The yellow lines are a pixel ruler, labelled every 200 px.
+   Find your swimmer and read off a point on their body, for example the cap or the
+   middle of the back, as `x,y`. If they are not visible on the first frame (still
+   under water after the start), add `--index 150` to the frame command to look at a
+   later frame, and pass that frame number as `--swimmer-frame` below.
 
-4. Run detection and tracking (this is the slow part: a 2-minute 4K clip takes about
-   10 to 30 minutes on a laptop CPU with the default `rfdetr-medium`; add
-   `--detect-model rfdetr-nano` for a 5x faster first look):
+4. Run detection, camera motion and tracking (the slow part: roughly 10 to 20 minutes
+   on a laptop CPU per minute of video with the default `rfdetr-medium`; add
+   `--detect-model rfdetr-nano` for a 5x faster, less accurate first look):
 
    ```
-   uv run swimtech run clip.MOV --race-id test1 --lane 4 --lane-box 120,640,3800,980 --to track
+   uv run swimtech run C:\Users\you\Downloads\IMG_1234.MOV --race-id race1 --lane 4 --swimmer 560,890 --to track
    ```
 
-   `--lane 4` is only a label for the results; `--lane-box` is what picks the swimmer.
-   If you leave both out, the tracker follows the longest-visible swimmer and warns.
+   `--lane 4` is only a label for the results. `--swimmer x,y` is what picks the
+   swimmer. If you leave it out, the tracker follows the longest-visible swimmer and
+   warns. (`--lane-box` and `--calib-corners` still exist for a camera on a tripod.)
 
-5. Open `data\test1.crop.mp4`. Tell me: does it stay on the swimmer? Where does it
-   jump? Paste the console log. `data\test1.crop.parquet` has the crop position per
-   frame and a `tracked` column (2 = detected, 1 = short gap filled, 0 = held).
+5. Make the review video and watch it:
 
-Re-running the same command skips stages whose outputs are already there; add
-`--force` to redo everything.
+   ```
+   uv run swimtech preview race1
+   ```
+
+   Open `data\race1.track.mp4`: the full frame with a box drawn on the swimmer we
+   followed, green while tracked, orange across a short gap, red when lost (the box
+   then just holds the last position). Tell me where the green box is on the wrong
+   swimmer, and where it goes red while your swimmer is clearly visible. Paste the
+   console log. `data\race1.crop.mp4` is the close-up the pose model will see, and
+   `data\race1.probe.json` has the quality and tracking reports: how much of the race
+   the swimmer was found in, the longest gap, and how big they were in pixels.
+
+Re-running the same command reuses the slow detection step; only tracking repeats, in
+seconds. So trying a different `--swimmer` point is cheap. Add `--force` to redo
+everything.
 
 ## 5. Secrets
 
@@ -112,7 +126,11 @@ in production (Stage 5).
 ## If anything fails
 
 Paste the full error and stop. Don't debug the install yourself unless you want to.
-Two errors you may see and what they mean:
+Errors you may see and what they mean:
 
-- `ffmpeg not found on PATH`: step 1 above; open a new terminal after installing.
+- `ffmpeg not found on PATH`: step 1 above; close and reopen VS Code after installing.
 - `rfdetr is not installed. Run uv sync --extra models`: step 4.1 above.
+- `Invalid value for 'src': Path ... does not exist`: the clip path is wrong. Drag the
+  file into the terminal to paste its exact path.
+- `no track near the tapped point`: the swimmer was not detected on that frame. Try a
+  point on a frame where they are clearly visible (`--swimmer-frame`).

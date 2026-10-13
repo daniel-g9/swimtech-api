@@ -112,9 +112,8 @@ def check_quality(video: Path, th: QualityThresholds = QualityThresholds()) -> Q
     if q.glare > th.glare_max:
         q.warnings.append("Glare on the water. Sit with windows behind you or use a polarizer.")
         penalties += 0.2
-    if q.shake_px > th.shake_max_px:
-        q.warnings.append("The camera moved during the race. Use a tripod and don't touch it.")
-        penalties += 0.3
+    # Camera movement is allowed (handheld, following the swimmer). shake_px is kept as a
+    # measurement only; the tracker compensates for it (swimtech/motion.py).
     q.warnings = q.warnings[:3]
     q.score = max(0.0, 1.0 - penalties)
     return q

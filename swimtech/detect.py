@@ -200,6 +200,24 @@ def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         return np.where(union > 0, inter / union, 0.0)
 
 
+def dedupe_boxes(boxes: np.ndarray, iou_min: float = 0.7) -> np.ndarray:
+    """Non-maximum suppression on (k, 5) boxes with scores: when two boxes overlap by
+    more than `iou_min`, keep the higher-scoring one. RF-DETR has no NMS of its own
+    and at low thresholds emits several boxes per person."""
+    boxes = np.asarray(boxes, dtype=float).reshape(-1, 5)
+    if len(boxes) < 2:
+        return boxes
+    order = np.argsort(-boxes[:, 4])
+    boxes = boxes[order]
+    iou = iou_matrix(boxes[:, :4], boxes[:, :4])
+    keep = np.ones(len(boxes), dtype=bool)
+    for i in range(len(boxes)):
+        if not keep[i]:
+            continue
+        keep[i + 1 :] &= iou[i, i + 1 :] < iou_min
+    return boxes[keep]
+
+
 def greedy_match(iou: np.ndarray, iou_min: float) -> list[tuple[int, int]]:
     """Pair rows to columns by descending IoU, each used at most once."""
     pairs: list[tuple[int, int]] = []

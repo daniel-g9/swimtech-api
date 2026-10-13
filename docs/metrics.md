@@ -40,7 +40,7 @@ Rule for the oblique camera (open issue 1): all "vertical" signals are measured 
 ## Spaces
 
 - **image**: pixel coordinates of the normalized video. Angles are fine here because the recovery arm is above the water and not on the lane plane anyway.
-- **rect**: after lane-plane homography (task 1.5), in meters. Only near-surface points (shoulders, hips, wrist at entry) are valid here. Metric names ending in `_rect` use it. When no calibration exists the `_rect` metrics are omitted and the results JSON carries `"calibrated": false` (open issue 7).
+- **rect**: after lane-plane homography (task 1.5), in meters. **v1 note (Oct 12):** the camera is handheld and moves, so a fixed-camera homography is not available and the `_rect` metrics are deferred; v1 ships image-space metrics only. Only near-surface points (shoulders, hips, wrist at entry) are valid here. Metric names ending in `_rect` use it. When no calibration exists the `_rect` metrics are omitted and the results JSON carries `"calibrated": false` (open issue 7).
 
 ## Angle metrics
 

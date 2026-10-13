@@ -1,29 +1,34 @@
-"""Stage 1.4: lane tracker and crop. Follow one chosen swimmer and produce a steady crop.
+"""Stage 1.4: swimmer tracker and crop. Follow one chosen swimmer with a moving camera
+and produce a steady close-up.
 
-ByteTrack-style two-pass association over the detections; keep only the track inside
-the chosen lane; fill gaps up to 1 s by linear interpolation; smooth the box center with a
-15-frame moving average; fix the crop size to the 95th-percentile box height x 1.6.
+ByteTrack-style two-pass association over the detections, run in a stabilized "world"
+frame (the pixels of frame 0, using the camera motion from `motion.py`) so that a pan
+or zoom does not look like the swimmer jumping. The swimmer is chosen by one point
+tapped on them in the first frame (or, for a fixed camera, a lane box or polygon).
+When the track is lost (turn, underwater, splash, someone walking in front) the next
+track that starts near where the swimmer was heading is chained on. Gaps up to 1 s are
+interpolated; longer gaps hold the last position. The crop follows the swimmer's size
+(so zooming is fine) and is written as a fixed-size video.
 
-Output: <race_id>.crop.mp4 at the normalized fps and <race_id>.crop.parquet with
-columns frame, x0, y0, w, h (plus `tracked`) so crop coordinates map back to the
-normalized frame. The crop size is constant for the whole race.
+Output: <race_id>.crop.mp4 and <race_id>.crop.parquet with columns frame, x0, y0, w, h,
+scale, tracked. Crop pixel (u, v) maps back to normalized-frame pixel
+(x0 + u * scale, y0 + v * scale); `tracked` is 2 detected, 1 interpolated, 0 held.
 
 Why the tracker is in-house: Roboflow's `trackers` package (Apache 2.0) depends on the
 non-headless OpenCV build, which clashes with the headless one this repo ships, and
 supervision's own ByteTrack is deprecated for removal. The association logic is ~100
-lines, has no learned parts, and is tested here on synthetic data; swapping in a library
-tracker later only changes `ByteTracker`.
+lines, has no learned parts, and is tested here on synthetic data.
 
 Teaching notes
 --------------
 ByteTrack's idea: match confident boxes first, then let the *low-confidence* boxes that
 every other tracker throws away rescue the tracks that didn't find a confident match.
 Splash makes a swimmer a low-confidence box for a few frames; this is what survives it.
+On real footage the detector is unsure about swimmers (median score ~0.25) and sure
+about spectators, so new tracks are allowed to start from moderately confident boxes.
 Each track predicts where it will be next (constant velocity) so a box that moved is
-still matched by overlap. The lane constraint turns a hard multi-object problem into
-"one swimmer in a corridor", so ID swaps become nearly impossible. A fixed crop size
-matters: pose models are sensitive to scale jitter, and a crop that breathes with the
-box makes the skeleton jitter too.
+still matched by overlap. Doing all of this in world coordinates is what makes a
+handheld, panning camera work: the background holds still, only the swimmers move.
 """
 
 from __future__ import annotations
@@ -39,12 +44,19 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
-from swimtech.detect import iou_matrix
+from swimtech.detect import dedupe_boxes, iou_matrix
+from swimtech.motion import (
+    apply,
+    boxes_to_frame,
+    boxes_to_world,
+    cumulative,
+    water_fraction,
+)
 
 log = logging.getLogger("swimtech.track")
 
 TRACK_COLUMNS = ["frame", "cx", "cy", "w", "h", "score", "tracked"]
-CROP_COLUMNS = ["frame", "x0", "y0", "w", "h", "tracked"]
+CROP_COLUMNS = ["frame", "x0", "y0", "w", "h", "scale", "tracked"]
 
 # `tracked` values in the track and crop tables.
 TRACKED_HELD = 0  # no box within max_gap: position held from the nearest known frame
@@ -53,14 +65,15 @@ TRACKED_DETECTED = 2  # a detection was associated on this frame
 
 
 @dataclass(frozen=True)
-class LaneSelection:
-    """Where the swimmer of interest is. One of:
-    - `box`: x0, y0, x1, y1 drawn on the first frame (normalized-video pixels), or
-    - `polygon`: the lane quadrilateral, normally the four calibration corners (1.5), or
-    - nothing: pick the longest-lived track and warn (fine for a single-lane clip).
-    `lane_number` is a label carried into the results; it does not locate anything by
-    itself because the camera can be anywhere in the stands."""
+class SwimmerSelection:
+    """Which swimmer to follow. One of:
+    - `point`: a tap on the swimmer, in pixels of frame `point_frame` (the normal way), or
+    - `box` / `polygon`: a lane region in frame-0 pixels (fixed camera only), or
+    - nothing: the longest-lived track, with a warning.
+    `lane_number` is a label carried into the results; it locates nothing by itself."""
 
+    point: tuple[float, float] | None = None
+    point_frame: int = 0
     box: tuple[float, float, float, float] | None = None
     polygon: list[list[float]] | None = None
     lane_number: int | None = None
@@ -74,20 +87,30 @@ class LaneSelection:
         return None
 
 
+LaneSelection = SwimmerSelection  # older name
+
+
 @dataclass(frozen=True)
 class TrackConfig:
     max_gap_s: float = 1.0  # gaps up to this are interpolated; longer ones are held
     center_smooth_frames: int = 15
     crop_scale: float = 1.6
-    crop_height_percentile: float = 95.0
+    crop_size_smooth_s: float = 2.0  # rolling median window for the crop size
+    crop_min_px: int = 32
     # ByteTrack association
-    high_score: float = 0.6  # first pass uses boxes at or above this
+    high_score: float = 0.4  # first pass and new tracks use boxes at or above this
     low_score: float = 0.1  # second pass uses boxes between low and high
     match_iou_high: float = 0.3
     match_iou_low: float = 0.2
     lost_buffer_s: float = 1.0  # a track survives this long without a match
     min_hits: int = 2  # a track needs this many detections to count
-    min_in_lane: float = 0.6  # fraction of a track's centers inside the corridor
+    # Selection
+    min_in_lane: float = 0.6  # corridor mode: fraction of centers inside the region
+    reacquire_s: float = 15.0  # point mode: how long after a loss we still look
+    reacquire_radius: float = 4.0  # ... within this many box long-sides of the prediction
+    reacquire_max_radius: float = 10.0  # ... never more than this many, however long the gap
+    dedupe_iou: float = 0.7  # overlapping detector boxes above this IoU are merged
+    water_min: float = 0.3  # a box must be at least this much on water to be a swimmer
 
 
 # ----------------------------------------------------------------------------- tracker
@@ -125,6 +148,10 @@ class _Track:
         self.lost = 0
 
 
+def _center(box: np.ndarray) -> np.ndarray:
+    return (box[:2] + box[2:]) / 2
+
+
 def _assign(tracks: list[_Track], boxes: np.ndarray, frame: int, iou_min: float) -> list[tuple]:
     """Hungarian matching on 1 - IoU between predicted track boxes and detections."""
     if not tracks or len(boxes) == 0:
@@ -137,7 +164,7 @@ def _assign(tracks: list[_Track], boxes: np.ndarray, frame: int, iou_min: float)
 
 class ByteTracker:
     """Online multi-object tracker. Call `update` once per frame in order; read
-    `finished` + `active` afterwards."""
+    `tracks` afterwards. Coordinates are whatever you feed it (world, normally)."""
 
     def __init__(self, fps: float, cfg: TrackConfig = TrackConfig()) -> None:
         self.cfg = cfg
@@ -146,11 +173,28 @@ class ByteTracker:
         self.finished: list[_Track] = []
         self._next_id = 1
 
-    def update(self, boxes: np.ndarray, frame: int) -> None:
-        """`boxes`: (k, 5) x0, y0, x1, y1, score on this frame (may be empty)."""
+    def update(self, boxes: np.ndarray, frame: int, seed: np.ndarray | None = None) -> None:
+        """`boxes`: (k, 5) x0, y0, x1, y1, score on this frame (may be empty).
+        `seed`: a point the user tapped on this frame; any box containing it may start
+        a track regardless of score (the detector is unsure about swimmers)."""
         boxes = np.asarray(boxes, dtype=float).reshape(-1, 5)
-        high = boxes[boxes[:, 4] >= self.cfg.high_score]
-        low = boxes[(boxes[:, 4] >= self.cfg.low_score) & (boxes[:, 4] < self.cfg.high_score)]
+        is_high = boxes[:, 4] >= self.cfg.high_score
+        if seed is not None and len(boxes):
+            under = (
+                (boxes[:, 0] <= seed[0])
+                & (seed[0] <= boxes[:, 2])
+                & (boxes[:, 1] <= seed[1])
+                & (seed[1] <= boxes[:, 3])
+                & (boxes[:, 4] >= self.cfg.low_score)
+            )
+            if under.any():
+                # Only the smallest box under the point: the others are duplicates or
+                # a lane-mate's box that happens to overlap.
+                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                pick = int(np.flatnonzero(under)[np.argmin(areas[under])])
+                is_high[pick] = True
+        high = boxes[is_high]
+        low = boxes[~is_high & (boxes[:, 4] >= self.cfg.low_score)]
 
         # Pass 1: confident boxes against every active track.
         matched_t: set[int] = set()
@@ -190,7 +234,7 @@ class ByteTracker:
         return [t for t in self.finished + self.active if len(t.frames) >= self.cfg.min_hits]
 
 
-# ---------------------------------------------------------------------- lane selection
+# ---------------------------------------------------------------------- selection
 
 
 def points_in_polygon(pts: np.ndarray, poly: np.ndarray) -> np.ndarray:
@@ -219,18 +263,16 @@ def _centers(t: _Track) -> np.ndarray:
 def select_lane_tracks(
     tracks: list[_Track], corridor: np.ndarray | None, cfg: TrackConfig = TrackConfig()
 ) -> list[_Track]:
-    """Pick the track(s) that are the swimmer of interest.
-
-    With a corridor: every track whose centers lie mostly inside it, merged in time
-    order if they don't overlap (the same swimmer re-acquired after a long gap).
-    Without one: the longest-lived track, with a warning."""
+    """Fixed-camera mode. With a corridor: every track whose centers lie mostly inside
+    it, merged in time order if they don't overlap. Without one: the longest-lived
+    track, with a warning."""
     if not tracks:
         return []
     if corridor is None:
         best = max(tracks, key=lambda t: len(t.frames))
         log.warning(
-            "no lane given: following the longest-lived track (id %d, %d frames). "
-            "Pass --lane-box or calibration corners to choose a lane.",
+            "no swimmer or lane given: following the longest-lived track (id %d, %d frames). "
+            "Pass --swimmer x,y to choose.",
             best.id,
             len(best.frames),
         )
@@ -241,7 +283,7 @@ def select_lane_tracks(
         if frac >= cfg.min_in_lane:
             scored.append((len(t.frames) * frac, t))
     if not scored:
-        log.warning("no track stays inside the lane corridor; nothing to crop")
+        log.warning("no track stays inside the lane region; nothing to crop")
         return []
     scored.sort(key=lambda s: -s[0])
     chosen: list[_Track] = []
@@ -253,27 +295,170 @@ def select_lane_tracks(
     return chosen
 
 
+def select_by_point(
+    tracks: list[_Track],
+    point: np.ndarray,
+    frame: int,
+    fps: float,
+    cfg: TrackConfig = TrackConfig(),
+) -> list[_Track]:
+    """Point mode. Start from the track whose box contains the tapped point at (or
+    nearest to) `frame`; whenever that track ends, chain on the track that starts
+    within `reacquire_s` closest to where the swimmer was heading (or to where they
+    vanished, which is what a turn at the wall looks like)."""
+    if not tracks:
+        return []
+    point = np.asarray(point, dtype=float)
+    best: _Track | None = None
+    best_d = np.inf
+    for t in tracks:
+        fr = np.asarray(t.frames)
+        i = int(np.argmin(np.abs(fr - frame)))
+        if abs(fr[i] - frame) > fps / 2:
+            continue
+        b = t.boxes[i]
+        diag = max(float(np.hypot(b[2] - b[0], b[3] - b[1])), 1.0)
+        d = float(np.linalg.norm(_center(b) - point)) / diag
+        inside = b[0] <= point[0] <= b[2] and b[1] <= point[1] <= b[3]
+        if not inside:
+            d += 1.0
+        if d < best_d:
+            best, best_d = t, d
+    if best is None or best_d > 3.0:
+        # Nothing on that frame. Treat the tap as "last seen here": take the first
+        # track that starts within the re-acquisition window close to the point.
+        best, best_d = None, np.inf
+        for t in tracks:
+            if t.frames[0] < frame or t.frames[0] - frame > cfg.reacquire_s * fps:
+                continue
+            b = t.boxes[0]
+            diag = max(float(np.hypot(b[2] - b[0], b[3] - b[1])), 1.0)
+            d = float(np.linalg.norm(_center(b) - point)) / diag
+            d += 0.5 * (t.frames[0] - frame) / fps  # sooner is better
+            if d < best_d:
+                best, best_d = t, d
+        if best is None or best_d > 3.0:
+            log.warning("no track near the tapped point at frame %d; nothing to crop", frame)
+            return []
+        log.info("no track at the tapped frame; starting from frame %d instead", best.frames[0])
+
+    chain = [best]
+    while True:
+        cur = chain[-1]
+        end = cur.last_frame
+        c_end = _center(cur.last_box)
+        w_end = max(float(cur.last_box[2] - cur.last_box[0]), 1.0)
+        h_end = max(float(cur.last_box[3] - cur.last_box[1]), 1.0)
+        size = max(w_end, h_end)
+        v = (cur.velocity[:2] + cur.velocity[2:]) / 2
+        nxt: _Track | None = None
+        nxt_cost = np.inf
+        for t in tracks:
+            if t in chain or t.frames[0] <= end:
+                continue
+            gap = t.frames[0] - end
+            if gap > cfg.reacquire_s * fps:
+                continue
+            b0 = t.boxes[0]
+            # Same kind of object: a swimmer seen from the stands is a wide, flat box;
+            # a spectator standing on deck is tall. Reject a shape change over 2.5x.
+            w0 = max(float(b0[2] - b0[0]), 1.0)
+            h0 = max(float(b0[3] - b0[1]), 1.0)
+            aspect_ratio = (w0 / h0) / (w_end / h_end)
+            size_ratio = max(w0, h0) / size
+            if not (1 / 2.5 <= aspect_ratio <= 2.5) or not (1 / 2.5 <= size_ratio <= 2.5):
+                continue
+            c0 = _center(b0)
+            d = min(
+                float(np.linalg.norm(c0 - (c_end + v * gap))),
+                float(np.linalg.norm(c0 - c_end)),
+            )
+            radius = min(
+                cfg.reacquire_radius * size + 0.5 * float(np.linalg.norm(v)) * gap,
+                cfg.reacquire_max_radius * size,
+            )
+            if d > radius:
+                continue
+            cost = d / radius + 0.3 * gap / (cfg.reacquire_s * fps)
+            cost -= 0.2 * min(len(t.frames), fps) / fps  # prefer tracks that last
+            if cost < nxt_cost:
+                nxt, nxt_cost = t, cost
+        if nxt is None:
+            break
+        chain.append(nxt)
+    log.info("swimmer track chain: %s", [(t.id, t.frames[0], t.last_frame) for t in chain])
+    return chain
+
+
 # ------------------------------------------------------------------------ the stage
 
 
 def track(
     det: pd.DataFrame,
-    lane: LaneSelection,
+    sel: SwimmerSelection,
     fps: float,
     cfg: TrackConfig = TrackConfig(),
     n_frames: int | None = None,
+    motion: pd.DataFrame | None = None,
+    water: np.ndarray | None = None,
+    frame_size: tuple[int, int] | None = None,
 ) -> pd.DataFrame:
-    """Detections -> one dense per-frame track (frame, cx, cy, w, h, score, tracked) for the
-    chosen swimmer. Frames without a box within `max_gap_s` hold the nearest known box
-    with tracked = 0 so the crop never jumps to nothing."""
+    """Detections (+ camera motion, + water mask) -> one dense per-frame track of the
+    chosen swimmer in normalized-frame pixels: frame, cx, cy, w, h, score, tracked.
+
+    `water`: (n_frames, gh, gw) uint8 grid from motion.estimate_water, with `frame_size`
+    (w, h). Boxes that are mostly not on water (spectators, the deck, someone in front
+    of the lens) are dropped before tracking: swimmers are always in the water."""
     if n_frames is None:
         n_frames = int(det["frame"].max()) + 1 if len(det) else 0
+    cum = (
+        cumulative(motion, n_frames)
+        if motion is not None
+        else np.repeat(np.eye(3)[None], max(n_frames, 1), 0)
+    )
+
+    det = det[["frame", "x0", "y0", "x1", "y1", "score"]]
+    if water is not None and len(water) and float(water.mean()) < 0.1:
+        # An unusual pool color, or the camera never pointed at the water. Filtering
+        # would throw everything away, so don't.
+        log.warning("water filter: could not find water in the clip; not filtering boxes")
+        water = None
+    if water is not None and frame_size is not None and len(det):
+        keep = np.ones(len(det), dtype=bool)
+        for f, idx in det.groupby("frame").indices.items():
+            if 0 <= int(f) < len(water):
+                wf = water_fraction(
+                    det.iloc[idx][["x0", "y0", "x1", "y1"]].to_numpy(), water[int(f)], *frame_size
+                )
+                keep[idx] = wf >= cfg.water_min
+        log.info("water filter: kept %d of %d boxes", int(keep.sum()), len(det))
+        det = det[keep]
+
+    # Everything below happens in world (frame-0) coordinates.
+    detw = det.copy()
+    if len(detw):
+        frames = detw["frame"].to_numpy(dtype=int)
+        detw[["x0", "y0", "x1", "y1"]] = boxes_to_world(
+            detw[["x0", "y0", "x1", "y1"]].to_numpy(), cum, frames
+        )
+    point_w = None
+    pf = 0
+    if sel.point is not None:
+        pf = min(max(int(sel.point_frame), 0), max(n_frames - 1, 0))
+        point_w = apply(np.linalg.inv(cum[pf]), np.asarray(sel.point, dtype=float))
+
     tracker = ByteTracker(fps, cfg)
-    by_frame = dict(tuple(det.groupby("frame"))) if len(det) else {}
+    by_frame = dict(tuple(detw.groupby("frame"))) if len(detw) else {}
     for f in range(n_frames):
         g = by_frame.get(f)
         boxes = g[["x0", "y0", "x1", "y1", "score"]].to_numpy(dtype=float) if g is not None else []
-        tracker.update(np.asarray(boxes, dtype=float).reshape(-1, 5), f)
+        boxes = dedupe_boxes(np.asarray(boxes, dtype=float).reshape(-1, 5), cfg.dedupe_iou)
+        tracker.update(boxes, f, seed=point_w if (point_w is not None and f == pf) else None)
+
+    if point_w is not None:
+        chosen = select_by_point(tracker.tracks, point_w, pf, fps, cfg)
+    else:
+        chosen = select_lane_tracks(tracker.tracks, sel.corridor(), cfg)
 
     out = pd.DataFrame(
         {
@@ -286,7 +471,7 @@ def track(
             "tracked": TRACKED_HELD,
         }
     )
-    for t in select_lane_tracks(tracker.tracks, lane.corridor(), cfg):
+    for t in chosen:
         b = np.stack(t.boxes)
         idx = np.asarray(t.frames)
         out.loc[idx, "cx"] = (b[:, 0] + b[:, 2]) / 2
@@ -295,7 +480,19 @@ def track(
         out.loc[idx, "h"] = b[:, 3] - b[:, 1]
         out.loc[idx, "score"] = t.scores
         out.loc[idx, "tracked"] = TRACKED_DETECTED
-    return fill_gaps(out, max_gap=int(round(cfg.max_gap_s * fps)))
+    out = fill_gaps(out, max_gap=int(round(cfg.max_gap_s * fps)))
+
+    # Back to the pixels of each frame.
+    if out["cx"].notna().any():
+        frames = out["frame"].to_numpy(dtype=int)
+        half = out[["w", "h"]].to_numpy() / 2
+        c = out[["cx", "cy"]].to_numpy()
+        bf = boxes_to_frame(np.hstack([c - half, c + half]), cum, frames)
+        out["cx"] = (bf[:, 0] + bf[:, 2]) / 2
+        out["cy"] = (bf[:, 1] + bf[:, 3]) / 2
+        out["w"] = bf[:, 2] - bf[:, 0]
+        out["h"] = bf[:, 3] - bf[:, 1]
+    return out
 
 
 def fill_gaps(track_df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
@@ -332,26 +529,33 @@ def fill_gaps(track_df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
 
 
 def crop_boxes(
-    track_df: pd.DataFrame, frame_w: int, frame_h: int, cfg: TrackConfig = TrackConfig()
+    track_df: pd.DataFrame,
+    frame_w: int,
+    frame_h: int,
+    cfg: TrackConfig = TrackConfig(),
+    fps: float = 30.0,
 ) -> pd.DataFrame:
-    """Track -> fixed-size square crop boxes clamped to the frame. Pure; testable without video.
+    """Track -> square crop boxes clamped to the frame. Pure; testable without video.
 
-    Side = 95th-percentile tracked box height x crop_scale, even-sized for the encoder,
-    never larger than the frame. The center is a centered moving average of the track."""
+    The side follows the swimmer's size (rolling median of box height over
+    `crop_size_smooth_s`, times `crop_scale`) so zoom is handled, while the median
+    keeps frame-to-frame jitter out. The center is a centered moving average. `scale`
+    is side / output video side; the output side is the 95th percentile of sides."""
     df = track_df.sort_values("frame").reset_index(drop=True)
     det = df[df["tracked"] == TRACKED_DETECTED]
     if det.empty:
         raise ValueError("no tracked frames; cannot size the crop")
-    side = float(np.percentile(det["h"], cfg.crop_height_percentile)) * cfg.crop_scale
-    side = min(side, float(frame_w), float(frame_h))
-    side = int(np.ceil(side / 2.0) * 2)
-    side = max(side, 2)
+    win_size = max(1, int(round(cfg.crop_size_smooth_s * fps)))
+    side = df["h"].rolling(win_size, center=True, min_periods=1).median() * cfg.crop_scale
+    side = np.clip(side.to_numpy(), cfg.crop_min_px, min(frame_w, frame_h))
+    side = (np.ceil(side / 2.0) * 2).astype(int)
+    out_side = int(np.ceil(np.percentile(side, 95) / 2.0) * 2)
 
     win = max(1, int(cfg.center_smooth_frames))
-    cx = df["cx"].rolling(win, center=True, min_periods=1).mean()
-    cy = df["cy"].rolling(win, center=True, min_periods=1).mean()
-    x0 = np.clip(np.round(cx - side / 2), 0, max(frame_w - side, 0)).astype(int)
-    y0 = np.clip(np.round(cy - side / 2), 0, max(frame_h - side, 0)).astype(int)
+    cx = df["cx"].rolling(win, center=True, min_periods=1).mean().to_numpy()
+    cy = df["cy"].rolling(win, center=True, min_periods=1).mean().to_numpy()
+    x0 = np.clip(np.round(cx - side / 2), 0, np.maximum(frame_w - side, 0)).astype(int)
+    y0 = np.clip(np.round(cy - side / 2), 0, np.maximum(frame_h - side, 0)).astype(int)
     return pd.DataFrame(
         {
             "frame": df["frame"].astype(int),
@@ -359,23 +563,63 @@ def crop_boxes(
             "y0": y0,
             "w": side,
             "h": side,
+            "scale": side / out_side,
             "tracked": df["tracked"].astype(int),
         }
     )[CROP_COLUMNS]
 
 
+def tracking_report(track_df: pd.DataFrame, fps: float) -> dict:
+    """What the user needs to know about whether we could see the swimmer.
+    Goes into the probe JSON after the track stage."""
+    t = track_df["tracked"].to_numpy()
+    held = t == TRACKED_HELD
+    longest = 0
+    run = 0
+    for h in held:
+        run = run + 1 if h else 0
+        longest = max(longest, run)
+    det = track_df[track_df["tracked"] == TRACKED_DETECTED]
+    height = float(det["h"].median()) if len(det) else 0.0
+    rep = {
+        "detected_frac": round(float((t == TRACKED_DETECTED).mean()), 3),
+        "interpolated_frac": round(float((t == TRACKED_INTERP).mean()), 3),
+        "held_frac": round(float(held.mean()), 3),
+        "longest_gap_s": round(longest / fps, 1),
+        "swimmer_height_px": round(height, 0),
+        "warnings": [],
+    }
+    if rep["detected_frac"] + rep["interpolated_frac"] < 0.6:
+        rep["warnings"].append(
+            f"Swimmer found in only {100 * (1 - rep['held_frac']):.0f}% of frames. "
+            "Keep them in view and closer to the camera."
+        )
+    if rep["longest_gap_s"] >= 5:
+        rep["warnings"].append(
+            f"Swimmer lost for {rep['longest_gap_s']:.0f} s at a stretch (turn, obstruction or "
+            "underwater phase)."
+        )
+    if 0 < height < 60:
+        rep["warnings"].append(
+            f"Swimmer is only ~{height:.0f} px tall; limbs will be hard to see. Move closer or "
+            "use the telephoto lens."
+        )
+    return rep
+
+
 def write_crop_video(
     norm_video: Path, crops: pd.DataFrame, out: Path, fps: float | None = None
 ) -> int:
-    """Cut the crop out of every frame and encode it. Uses ffmpeg (H.264) when it is on
-    PATH, otherwise OpenCV's built-in mp4v encoder; both are readable by cv2 in 2.1.
-    Returns the number of frames written."""
+    """Cut the crop out of every frame, resize to the fixed output side, encode. Uses
+    ffmpeg (H.264) when it is on PATH, otherwise OpenCV's built-in mp4v encoder; both
+    are readable by cv2 in 2.1. Returns the number of frames written."""
     cap = cv2.VideoCapture(str(norm_video))
     if not cap.isOpened():
         raise FileNotFoundError(norm_video)
     fps = fps or float(cap.get(cv2.CAP_PROP_FPS)) or 60.0
     by_frame = crops.set_index("frame")
-    side_w, side_h = int(by_frame["w"].iloc[0]), int(by_frame["h"].iloc[0])
+    scale_col = by_frame["scale"] if "scale" in by_frame else pd.Series(1.0, index=by_frame.index)
+    out_side = int(round(float(by_frame["w"].iloc[0]) / float(scale_col.iloc[0])))
     out.parent.mkdir(parents=True, exist_ok=True)
 
     ffmpeg = shutil.which("ffmpeg")
@@ -394,7 +638,7 @@ def write_crop_video(
                 "-pix_fmt",
                 "bgr24",
                 "-s",
-                f"{side_w}x{side_h}",
+                f"{out_side}x{out_side}",
                 "-r",
                 f"{fps:g}",
                 "-i",
@@ -416,7 +660,9 @@ def write_crop_video(
         )
     else:
         log.warning("ffmpeg not on PATH; writing the crop video with OpenCV mp4v instead")
-        writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), fps, (side_w, side_h))
+        writer = cv2.VideoWriter(
+            str(out), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_side, out_side)
+        )
         if not writer.isOpened():
             raise RuntimeError("OpenCV could not open a video writer; install ffmpeg")
 
@@ -430,17 +676,20 @@ def write_crop_video(
                 break
             if f in by_frame.index:
                 x0, y0 = int(by_frame.at[f, "x0"]), int(by_frame.at[f, "y0"])
-                patch = frame[y0 : y0 + side_h, x0 : x0 + side_w]
-                if patch.shape[0] != side_h or patch.shape[1] != side_w:  # edge safety
+                w, h = int(by_frame.at[f, "w"]), int(by_frame.at[f, "h"])
+                patch = frame[y0 : y0 + h, x0 : x0 + w]
+                if patch.shape[0] != h or patch.shape[1] != w:  # edge safety
                     patch = cv2.copyMakeBorder(
                         patch,
                         0,
-                        side_h - patch.shape[0],
+                        h - patch.shape[0],
                         0,
-                        side_w - patch.shape[1],
+                        w - patch.shape[1],
                         cv2.BORDER_CONSTANT,
                         value=(0, 0, 0),
                     )
+                if (h, w) != (out_side, out_side):
+                    patch = cv2.resize(patch, (out_side, out_side), interpolation=cv2.INTER_AREA)
                 if proc is not None and proc.stdin is not None:
                     proc.stdin.write(np.ascontiguousarray(patch).tobytes())
                 elif writer is not None:
@@ -456,11 +705,12 @@ def write_crop_video(
                 raise RuntimeError(f"ffmpeg failed with code {proc.returncode}")
         if writer is not None:
             writer.release()
-    log.info("crop video: %d frames of %dx%d -> %s", n, side_w, side_h, out)
+    log.info("crop video: %d frames of %dx%d -> %s", n, out_side, out_side, out)
     return n
 
 
 def crop_to_frame(xy_crop: np.ndarray, crops: pd.DataFrame) -> np.ndarray:
-    """Map (n, k, 2) crop-space keypoints back to normalized-frame pixels."""
+    """Map (n, k, 2) crop-video keypoints back to normalized-frame pixels."""
     off = crops[["x0", "y0"]].to_numpy(dtype=float)[:, None, :]
-    return xy_crop + off
+    scale = crops["scale"].to_numpy(dtype=float)[:, None, None] if "scale" in crops else 1.0
+    return xy_crop * scale + off

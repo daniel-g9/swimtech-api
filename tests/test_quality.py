@@ -52,9 +52,12 @@ def test_featureless_top_strip_is_not_mistaken_for_shake(tmp_path):
     assert not any("moved" in w for w in q.warnings)
 
 
-def test_shaky_clip_warns(tmp_path):
+def test_camera_motion_is_measured_but_not_a_warning(tmp_path):
+    """The camera is allowed to move (handheld, following the swimmer). We record how
+    much it moved; the tracker compensates for it."""
     base = _texture(w=400)
     frames = [np.ascontiguousarray(np.roll(base, 6 * f, axis=1)) for f in range(12)]
-    q = check_quality(write_video(tmp_path / "shake.mp4", frames), TH)
+    q = check_quality(write_video(tmp_path / "pan.mp4", frames), TH)
     assert q.shake_px > 2.0
-    assert any("moved" in w for w in q.warnings)
+    assert q.warnings == []
+    assert q.score == 1.0

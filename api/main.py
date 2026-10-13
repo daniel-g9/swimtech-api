@@ -57,7 +57,9 @@ class RaceCreated(BaseModel):
 
 class ProcessRequest(BaseModel):
     lane_number: int | None = None
-    lane_box: tuple[float, float, float, float] | None = None
+    swimmer_point: tuple[float, float] | None = None  # tap on the swimmer (normal way)
+    swimmer_frame: int = 0  # which frame the tap was made on
+    lane_box: tuple[float, float, float, float] | None = None  # fixed camera only
     calib_corners: list[list[float]] | None = Field(default=None, min_length=4, max_length=4)
 
 
@@ -112,6 +114,8 @@ def _process(race_id: str, req: ProcessRequest) -> None:
                 race_id=race_id,
                 work_dir=DATA_DIR,
                 lane_number=req.lane_number,
+                swimmer_point=req.swimmer_point,
+                swimmer_frame=req.swimmer_frame,
                 lane_box=req.lane_box,
                 calib_corners=req.calib_corners,
             )

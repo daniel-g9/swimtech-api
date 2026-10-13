@@ -2,7 +2,7 @@
 
 swimtech ingest IMG_1234.MOV --race-id meet1_r3
 swimtech frame data/test1.norm.mp4 --out first.jpg      # pick a lane box by eye
-swimtech run clip.MOV --race-id test1 --lane-box 120,640,3800,980 --to track
+swimtech run clip.MOV --race-id test1 --swimmer 560,890 --to track
 swimtech metrics          # list the registry
 """
 
@@ -34,6 +34,16 @@ def _parse_box(text: str | None) -> tuple[float, float, float, float] | None:
     if len(vals) != 4:
         raise typer.BadParameter("--lane-box needs four numbers: x0,y0,x1,y1")
     return vals  # type: ignore[return-value]
+
+
+def _parse_point(text: str | None) -> tuple[float, float] | None:
+    if not text:
+        return None
+    try:
+        x, y = (float(v) for v in text.split(","))
+    except ValueError as e:
+        raise typer.BadParameter("--swimmer needs two numbers: x,y") from e
+    return (x, y)
 
 
 def _parse_corners(text: str | None) -> list[list[float]] | None:
@@ -79,13 +89,18 @@ def run(
     race_id: str = typer.Option(..., "--race-id"),
     work_dir: Path = typer.Option(Path("data")),
     stroke: str = typer.Option("free", help="free | back | breast | fly (v1: free)"),
-    lane: int | None = typer.Option(None, help="Lane number (a label; see --lane-box)"),
+    swimmer: str | None = typer.Option(
+        None, help="x,y of the swimmer on the first frame (see `swimtech frame`)"
+    ),
+    swimmer_frame: int = typer.Option(0, help="Frame index the --swimmer point was read on"),
+    lane: int | None = typer.Option(None, help="Lane number (a label only)"),
     lane_box: str | None = typer.Option(
-        None, help="x0,y0,x1,y1 on the first frame enclosing the swimmer's lane"
+        None, help="Fixed camera only: x0,y0,x1,y1 enclosing the swimmer's lane"
     ),
     calib_corners: str | None = typer.Option(
         None,
-        help="Lane corners 'x,y;x,y;x,y;x,y' (near-left, near-right, far-right, far-left)",
+        help="Fixed camera only: lane corners 'x,y;x,y;x,y;x,y' "
+        "(near-left, near-right, far-right, far-left)",
     ),
     detect_model: str | None = typer.Option(
         None, help="rfdetr-nano | rfdetr-small | rfdetr-medium (default) | rfdetr-large"
@@ -104,6 +119,8 @@ def run(
         race_id=race_id,
         work_dir=work_dir,
         stroke=stroke,  # type: ignore[arg-type]
+        swimmer_point=_parse_point(swimmer),
+        swimmer_frame=swimmer_frame,
         lane_number=lane,
         lane_box=_parse_box(lane_box),
         calib_corners=_parse_corners(calib_corners),
@@ -121,6 +138,9 @@ def run(
     except ModelsNotInstalledError as e:
         typer.secho(f"stopped: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=3) from e
+    except RuntimeError as e:
+        typer.secho(f"stopped: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=4) from e
     typer.echo(f"done up to '{to}'; outputs in {paths.work_dir}")
 
 
@@ -137,6 +157,29 @@ def frame(
 
     w, h = save_frame_with_grid(video, out, index=index, grid=grid)
     typer.echo(f"wrote {out} ({w}x{h}); coordinates are normalized-video pixels")
+
+
+@app.command()
+def preview(
+    race_id: str = typer.Argument(..., help="A race that has been run to the track stage"),
+    work_dir: Path = typer.Option(Path("data")),
+    out: Path | None = typer.Option(None, help="Default: data/<race_id>.track.mp4"),
+) -> None:
+    """Write a full-frame video with the tracked box drawn (green = tracked, orange = gap
+    filled, red = lost), to check by eye that it followed the right swimmer."""
+    import pandas as pd
+
+    from swimtech.types import RacePaths
+    from swimtech.viz import save_track_preview
+
+    paths = RacePaths(work_dir=work_dir, race_id=race_id)
+    if not paths.crop_offsets.exists():
+        raise typer.BadParameter(
+            f"{paths.crop_offsets} not found; run `swimtech run ... --to track`"
+        )
+    target = out or (paths.work_dir / f"{race_id}.track.mp4")
+    n = save_track_preview(paths.norm_video, pd.read_parquet(paths.crop_offsets), target)
+    typer.echo(f"wrote {target} ({n} frames)")
 
 
 @app.command()

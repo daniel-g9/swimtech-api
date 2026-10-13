@@ -12,8 +12,10 @@ swimtech/          the pipeline: one module per stage, pure functions, no global
   ingest.py        1.1  phone clip -> <race_id>.norm.mp4 + probe JSON
   quality.py       1.2  blur / glare / shake warnings
   detect.py        1.3  RF-DETR person boxes at 15 fps, interpolated to every frame
-  track.py         1.4  ByteTrack-style association + lane constraint -> steady crop
-  calib.py         1.5  lane-plane homography for _rect metrics
+  motion.py        1.4  camera motion per frame (handheld, panning, zooming cameras)
+  track.py         1.4  ByteTrack-style association in a stabilized frame; tap-to-pick
+                        swimmer with re-acquisition after gaps -> size-following crop
+  calib.py         1.5  lane-plane homography for _rect metrics (fixed camera; deferred)
   models.py        loads / exports the detector (and later the pose model); lazy torch
   viz.py           gridded frame export for picking a lane box by eye (task 1.6)
   pose.py          2.1  RTMPose 13 keypoints per frame
@@ -38,10 +40,10 @@ samples/           sample.results.json for the Vue app to build against
 | 0 | 0.1 metric spec | done (`docs/metrics.md`, registry) |
 | 1 | 1.1 ingest | done, tested with a synthetic clip |
 | 1 | 1.2 quality | done, tested |
-| 1 | 1.3 detector | done, tested with a fake detector; real RF-DETR call unverified until footage |
-| 1 | 1.4 tracker + crop | done, tested on synthetic two-lane sequences |
-| 1 | 1.5 calibration | done, tested |
-| 1 | 1.6 run on one clip | yours; see `docs/setup.md` section 4 |
+| 1 | 1.3 detector | done; on real footage swimmers score low (~0.25) and spectators high, so Stage 3 fine-tuning is likely |
+| 1 | 1.4 motion + tracker + crop | done; moving camera supported; tested on synthetic pans/zooms and two real clips |
+| 1 | 1.5 calibration | done, tested; unusable with a moving camera, so `_rect` metrics are deferred |
+| 1 | 1.6 run on one clip | in progress with real clips; see `docs/setup.md` section 4 |
 | 2 | 2.2 smoothing | stage function done; wiring lands with 2.1 |
 | 2 | everything else | stubs |
 

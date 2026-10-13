@@ -75,7 +75,11 @@ def test_second_run_is_cached(moving_blob_video, tmp_path, caplog):
     with caplog.at_level("INFO", logger="swimtech"):
         run(opts, stages=_stages_with_fake_detector())
     cached = [r.message for r in caplog.records if "cached" in r.message]
-    assert any("[detect]" in m for m in cached) and any("[track]" in m for m in cached)
+    ran = [r.message for r in caplog.records if "running" in r.message]
+    # The slow stages are reused; track is cheap and depends on the swimmer selection,
+    # so it always runs again.
+    assert any("[detect]" in m for m in cached) and any("[motion]" in m for m in cached)
+    assert any("[track]" in m for m in ran)
 
 
 def test_resolve_lane_priority(tmp_path):

@@ -22,6 +22,7 @@ STAGES: tuple[str, ...] = (
     "ingest",
     "quality",
     "detect",
+    "motion",
     "track",
     "pose",
     "smooth",
@@ -39,9 +40,11 @@ class RunOptions:
     race_id: str
     work_dir: Path = Path("data")
     stroke: Stroke = "free"
-    lane_box: tuple[float, float, float, float] | None = None
+    swimmer_point: tuple[float, float] | None = None  # tap on the swimmer (normal way)
+    swimmer_frame: int = 0
+    lane_box: tuple[float, float, float, float] | None = None  # fixed camera only
     lane_number: int | None = None
-    calib_corners: list[list[float]] | None = None
+    calib_corners: list[list[float]] | None = None  # fixed camera only
     detect_model: str | None = None  # None -> DetectConfig default
     to: str = "results"
     force: bool = False
@@ -76,18 +79,16 @@ def run(
     return paths
 
 
-# Which files each stage reads and writes. Used only for cache freshness.
+# Which files each stage reads and writes. Used only for cache freshness. Stages with
+# no "out" always run (they write into probe_json or are not implemented yet).
 STAGE_IO: dict[str, Callable[[RacePaths, RunOptions], dict[str, list[Path]]]] = {
     "ingest": lambda p, o: {"in": [Path(o.src)], "out": [p.norm_video, p.probe_json]},
-    "quality": lambda p, o: {
-        "in": [p.norm_video],
-        "out": [],
-    },  # writes into probe_json; always re-run
+    "quality": lambda p, o: {"in": [p.norm_video], "out": []},
     "detect": lambda p, o: {"in": [p.norm_video], "out": [p.detections]},
-    "track": lambda p, o: {
-        "in": [p.detections, p.norm_video, p.calib_json],
-        "out": [p.crop_video, p.crop_offsets],
-    },
+    # Motion masks out detected people, so it runs after detect.
+    "motion": lambda p, o: {"in": [p.norm_video, p.detections], "out": [p.motion, p.water]},
+    # Track is cheap and depends on the selection options, so it always re-runs.
+    "track": lambda p, o: {"in": [p.detections, p.motion, p.norm_video], "out": []},
     "pose": lambda p, o: {"in": [p.crop_video], "out": [p.keypoints_raw]},
     "smooth": lambda p, o: {"in": [p.keypoints_raw], "out": [p.keypoints]},
     "cycles": lambda p, o: {"in": [p.keypoints], "out": []},
@@ -98,22 +99,35 @@ STAGE_IO: dict[str, Callable[[RacePaths, RunOptions], dict[str, list[Path]]]] = 
 }
 
 
-def resolve_lane(opts: RunOptions, paths: RacePaths):
-    """Turn the run options into a LaneSelection (1.4). Priority: an explicit box on the
-    first frame, then calibration corners (given now, or saved earlier as calib.json),
-    then nothing (the tracker follows the longest-lived swimmer and warns)."""
+def resolve_selection(opts: RunOptions, paths: RacePaths):
+    """Turn the run options into a SwimmerSelection (1.4). Priority: a tap on the
+    swimmer, then a box on the first frame, then calibration corners (given now, or
+    saved earlier as calib.json), then nothing (longest-lived track, with a warning).
+    Box and corners only make sense for a fixed camera."""
     from swimtech.calib import Calibration, calibrate
-    from swimtech.track import LaneSelection
+    from swimtech.track import SwimmerSelection
 
+    if opts.swimmer_point is not None:
+        return SwimmerSelection(
+            point=opts.swimmer_point, point_frame=opts.swimmer_frame, lane_number=opts.lane_number
+        )
+    if opts.lane_box is not None:
+        return SwimmerSelection(box=opts.lane_box, lane_number=opts.lane_number)
     polygon = None
     if opts.calib_corners is not None:
-        cal = calibrate(opts.calib_corners, paths.calib_json)
-        polygon = cal.corners_px
+        polygon = calibrate(opts.calib_corners, paths.calib_json).corners_px
     elif paths.calib_json.exists():
         polygon = Calibration.load(paths.calib_json).corners_px
-    if opts.lane_box is not None:
-        return LaneSelection(box=opts.lane_box, lane_number=opts.lane_number)
-    return LaneSelection(polygon=polygon, lane_number=opts.lane_number)
+    return SwimmerSelection(polygon=polygon, lane_number=opts.lane_number)
+
+
+resolve_lane = resolve_selection  # older name
+
+
+def _update_probe(paths: RacePaths, key: str, value: dict) -> None:
+    probe = json.loads(paths.probe_json.read_text()) if paths.probe_json.exists() else {}
+    probe[key] = value
+    paths.probe_json.write_text(json.dumps(probe, indent=2))
 
 
 def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
@@ -129,11 +143,18 @@ def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
         from swimtech.quality import check_quality
 
         q = check_quality(p.norm_video)
-        probe = json.loads(p.probe_json.read_text())
-        probe["quality"] = q.to_json()
-        p.probe_json.write_text(json.dumps(probe, indent=2))
+        _update_probe(p, "quality", q.to_json())
         for w in q.warnings:
             log.warning("[quality] %s", w)
+
+    def _motion(o: RunOptions, p: RacePaths) -> None:
+        import pandas as pd
+
+        from swimtech.motion import estimate_motion, estimate_water
+
+        det = pd.read_parquet(p.detections) if p.detections.exists() else None
+        estimate_motion(p.norm_video, p.motion, exclude=det)
+        estimate_water(p.norm_video, p.water)
 
     def _detect(o: RunOptions, p: RacePaths) -> None:
         from swimtech.detect import DetectConfig, detect
@@ -144,14 +165,35 @@ def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
     def _track(o: RunOptions, p: RacePaths) -> None:
         import pandas as pd
 
-        from swimtech.track import crop_boxes, track, write_crop_video
+        from swimtech.track import crop_boxes, track, tracking_report, write_crop_video
 
         probe = json.loads(p.probe_json.read_text())
         fps = float(probe["target_fps"])
         det = pd.read_parquet(p.detections)
+        from swimtech.motion import load_water
+
+        motion = pd.read_parquet(p.motion) if p.motion.exists() else None
         n_frames = _count_frames(p.norm_video)
-        t = track(det, resolve_lane(o, p), fps, n_frames=n_frames)
-        crops = crop_boxes(t, int(probe["width"]), int(probe["height"]))
+        t = track(
+            det,
+            resolve_selection(o, p),
+            fps,
+            n_frames=n_frames,
+            motion=motion,
+            water=load_water(p.water),
+            frame_size=(int(probe["width"]), int(probe["height"])),
+        )
+        report = tracking_report(t, fps)
+        _update_probe(p, "tracking", report)
+        for w in report["warnings"]:
+            log.warning("[track] %s", w)
+        if report["detected_frac"] == 0:
+            raise RuntimeError(
+                "the swimmer was not found anywhere in the clip. Check the --swimmer point "
+                "against `swimtech frame`, or pick a frame where they are clearly visible "
+                "with --swimmer-frame."
+            )
+        crops = crop_boxes(t, int(probe["width"]), int(probe["height"]), fps=fps)
         crops.to_parquet(p.crop_offsets, index=False)
         write_crop_video(p.norm_video, crops, p.crop_video, fps=fps)
 
@@ -165,6 +207,7 @@ def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
         "ingest": _ingest,
         "quality": _quality,
         "detect": _detect,
+        "motion": _motion,
         "track": _track,
         "pose": _todo("2.1"),
         "smooth": _todo("2.2 (stage function exists; wiring lands with 2.1)"),
