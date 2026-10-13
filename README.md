@@ -12,7 +12,8 @@ swimtech/          the pipeline: one module per stage, pure functions, no global
   ingest.py        1.1  phone clip -> <race_id>.norm.mp4 + probe JSON
   quality.py       1.2  blur / glare / shake warnings
   detect.py        1.3  RF-DETR person boxes at 15 fps, interpolated to every frame
-  motion.py        1.4  camera motion per frame (handheld, panning, zooming cameras)
+  motion.py        1.4  camera motion per frame (handheld, panning, zooming cameras); water mask
+  lanes.py         1.4  lane-rope direction, so re-acquisition stays in the swimmer's lane
   track.py         1.4  ByteTrack-style association in a stabilized frame; tap-to-pick
                         swimmer with re-acquisition after gaps -> size-following crop
   calib.py         1.5  lane-plane homography for _rect metrics (fixed camera; deferred)

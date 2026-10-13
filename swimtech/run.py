@@ -182,6 +182,7 @@ def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
             motion=motion,
             water=load_water(p.water),
             frame_size=(int(probe["width"]), int(probe["height"])),
+            lane_dir=_lane_dir_at(p.norm_video, o.swimmer_frame if o.swimmer_point else 0),
         )
         report = tracking_report(t, fps)
         _update_probe(p, "tracking", report)
@@ -217,6 +218,28 @@ def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
         "render": _todo("2.6"),
         "results": _todo("2.7"),
     }
+
+
+def _lane_dir_at(video: Path, frame: int):
+    """Lane-rope direction on one frame (see lanes.lane_direction), or None."""
+    import cv2
+
+    from swimtech.lanes import angle_deg, lane_direction
+    from swimtech.motion import water_mask
+
+    cap = cv2.VideoCapture(str(video))
+    try:
+        if frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        ok, img = cap.read()
+    finally:
+        cap.release()
+    if not ok:
+        return None
+    d = lane_direction(img, water_mask(img))
+    if d is not None:
+        log.info("[track] lane direction from the ropes: %.1f deg", angle_deg(d))
+    return d
 
 
 def _count_frames(video: Path) -> int:

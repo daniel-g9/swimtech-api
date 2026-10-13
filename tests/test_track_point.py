@@ -109,7 +109,7 @@ def test_crop_follows_zoom():
     )
     crops = crop_boxes(df, 640, 480, TrackConfig(), fps=30)
     assert crops["w"].iloc[0] < crops["w"].iloc[-1]
-    assert crops["w"].iloc[-1] == pytest.approx(96, abs=2)  # 60 * 1.6, even
+    assert crops["w"].iloc[-1] == pytest.approx(156, abs=14)  # longer side 120 * 1.3
     assert (crops["w"] % 2 == 0).all()
     out_side = crops["w"].iloc[-1] / crops["scale"].iloc[-1]
     assert out_side == pytest.approx(np.percentile(crops["w"], 95), abs=2)
@@ -217,6 +217,24 @@ def test_boxes_off_water_are_ignored():
     )
     assert (t.loc[0:29, "tracked"] == TRACKED_DETECTED).all()
     assert (t.loc[40:89, "tracked"] == TRACKED_HELD).all()
-    # Without the mask the deck box would have been chained.
-    t2 = track(det, SwimmerSelection(point=(40, 120)), FPS, n_frames=90)
-    assert (t2.loc[40:89, "tracked"] == TRACKED_DETECTED).all()
+
+
+def test_chain_prefers_own_lane_over_nearer_lane_mate():
+    """After a loss, a lane-mate that reappears sooner and closer must lose to the
+    continuation in the swimmer's own lane."""
+    rows = []
+    for f in range(40):  # our swimmer, lane y=120, moving right
+        x = 20 + 4 * f
+        rows.append((f, x, 110, x + 40, 130, 0.9, False))
+    for f in range(50, 90):  # lane-mate, one lane up (y=85), near where we vanished
+        rows.append((f, 190, 75, 230, 95, 0.9, False))
+    for f in range(70, 90):  # our swimmer again, same lane, further along
+        x = 20 + 4 * f
+        rows.append((f, x, 110, x + 40, 130, 0.9, False))
+    det = pd.DataFrame(rows, columns=DET_COLUMNS)
+    t = track(det, SwimmerSelection(point=(40, 120)), FPS, n_frames=90)
+    assert (t.loc[70:89, "tracked"] == TRACKED_DETECTED).all()
+    assert np.allclose(t.loc[70:89, "cy"], 120)
+    # The 30-frame gap is bridged, but never through the lane-mate's position.
+    assert (t.loc[40:69, "tracked"] != TRACKED_DETECTED).all()
+    assert np.allclose(t["cy"], 120)

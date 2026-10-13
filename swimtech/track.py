@@ -94,9 +94,9 @@ LaneSelection = SwimmerSelection  # older name
 class TrackConfig:
     max_gap_s: float = 1.0  # gaps up to this are interpolated; longer ones are held
     center_smooth_frames: int = 15
-    crop_scale: float = 1.6
-    crop_size_smooth_s: float = 2.0  # rolling median window for the crop size
-    crop_min_px: int = 32
+    crop_scale: float = 1.3  # crop side = this x the box's longer side
+    crop_size_smooth_s: float = 4.0  # rolling median window for the crop size
+    crop_min_frac: float = 0.12  # never smaller than this share of the frame's short side
     # ByteTrack association
     high_score: float = 0.4  # first pass and new tracks use boxes at or above this
     low_score: float = 0.1  # second pass uses boxes between low and high
@@ -109,6 +109,9 @@ class TrackConfig:
     reacquire_s: float = 15.0  # point mode: how long after a loss we still look
     reacquire_radius: float = 4.0  # ... within this many box long-sides of the prediction
     reacquire_max_radius: float = 10.0  # ... never more than this many, however long the gap
+    lane_tolerance: float = (
+        0.75  # ... and within this many box heights of the swimmer's own lane line
+    )
     dedupe_iou: float = 0.7  # overlapping detector boxes above this IoU are merged
     water_min: float = 0.3  # a box must be at least this much on water to be a swimmer
 
@@ -301,8 +304,11 @@ def select_by_point(
     frame: int,
     fps: float,
     cfg: TrackConfig = TrackConfig(),
+    lane_dir: np.ndarray | None = None,
 ) -> list[_Track]:
-    """Point mode. Start from the track whose box contains the tapped point at (or
+    """Point mode. `lane_dir` (unit vector along the lane ropes, world coordinates)
+    is the lane prior until the swimmer has moved far enough to define their own line.
+    Start from the track whose box contains the tapped point at (or
     nearest to) `frame`; whenever that track ends, chain on the track that starts
     within `reacquire_s` closest to where the swimmer was heading (or to where they
     vanished, which is what a turn at the wall looks like)."""
@@ -333,7 +339,14 @@ def select_by_point(
                 continue
             b = t.boxes[0]
             diag = max(float(np.hypot(b[2] - b[0], b[3] - b[1])), 1.0)
-            d = float(np.linalg.norm(_center(b) - point)) / diag
+            rel = _center(b) - point
+            if lane_dir is not None:
+                off_lane = abs(float(lane_dir[0] * rel[1] - lane_dir[1] * rel[0]))
+                if off_lane > cfg.lane_tolerance * max(float(b[3] - b[1]), 1.0):
+                    continue
+                d = abs(float(rel @ lane_dir)) / diag  # distance along the lane only
+            else:
+                d = float(np.linalg.norm(rel)) / diag
             d += 0.5 * (t.frames[0] - frame) / fps  # sooner is better
             if d < best_d:
                 best, best_d = t, d
@@ -351,6 +364,11 @@ def select_by_point(
         h_end = max(float(cur.last_box[3] - cur.last_box[1]), 1.0)
         size = max(w_end, h_end)
         v = (cur.velocity[:2] + cur.velocity[2:]) / 2
+        # The lane. In world coordinates the pool holds still, so the path the swimmer
+        # has traced so far is a line along their lane. A re-acquired track must start
+        # within half a lane of that line: lane-mates swim parallel, at the same speed,
+        # and are otherwise indistinguishable from "the nearest swimmer heading our way".
+        lane_u, lane_pt, lane_h = _lane_axis(chain, lane_dir, point)
         nxt: _Track | None = None
         nxt_cost = np.inf
         for t in tracks:
@@ -369,6 +387,11 @@ def select_by_point(
             if not (1 / 2.5 <= aspect_ratio <= 2.5) or not (1 / 2.5 <= size_ratio <= 2.5):
                 continue
             c0 = _center(b0)
+            if lane_u is not None:
+                rel = c0 - lane_pt
+                off_lane = abs(float(lane_u[0] * rel[1] - lane_u[1] * rel[0]))
+                if off_lane > cfg.lane_tolerance * lane_h:
+                    continue
             d = min(
                 float(np.linalg.norm(c0 - (c_end + v * gap))),
                 float(np.linalg.norm(c0 - c_end)),
@@ -390,6 +413,27 @@ def select_by_point(
     return chain
 
 
+def _lane_axis(
+    chain: list[_Track], default_dir: np.ndarray | None, default_pt: np.ndarray
+) -> tuple[np.ndarray | None, np.ndarray, float]:
+    """The swimmer's lane line: direction (unit vector), a point on it, and the median
+    box height. From the swimmer's own path once they have moved a few box-lengths
+    (robust to perspective); until then from the lane-rope direction through the
+    tapped point; with neither, no constraint."""
+    centers = np.vstack([_centers(t) for t in chain])
+    heights = np.concatenate([np.stack(t.boxes)[:, 3] - np.stack(t.boxes)[:, 1] for t in chain])
+    h = float(np.median(heights))
+    mean = centers.mean(axis=0)
+    if len(centers) >= 5:
+        _, s, vt = np.linalg.svd(centers - mean, full_matrices=False)
+        spread = s[0] / np.sqrt(len(centers))  # std along the main axis
+        if spread >= 3.0 * max(h, 1.0):
+            return vt[0] / np.linalg.norm(vt[0]), mean, h
+    if default_dir is not None:
+        return np.asarray(default_dir, dtype=float), np.asarray(default_pt, dtype=float), h
+    return None, mean, h
+
+
 # ------------------------------------------------------------------------ the stage
 
 
@@ -402,6 +446,7 @@ def track(
     motion: pd.DataFrame | None = None,
     water: np.ndarray | None = None,
     frame_size: tuple[int, int] | None = None,
+    lane_dir: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Detections (+ camera motion, + water mask) -> one dense per-frame track of the
     chosen swimmer in normalized-frame pixels: frame, cx, cy, w, h, score, tracked.
@@ -456,7 +501,7 @@ def track(
         tracker.update(boxes, f, seed=point_w if (point_w is not None and f == pf) else None)
 
     if point_w is not None:
-        chosen = select_by_point(tracker.tracks, point_w, pf, fps, cfg)
+        chosen = select_by_point(tracker.tracks, point_w, pf, fps, cfg, lane_dir=lane_dir)
     else:
         chosen = select_lane_tracks(tracker.tracks, sel.corridor(), cfg)
 
@@ -537,17 +582,22 @@ def crop_boxes(
 ) -> pd.DataFrame:
     """Track -> square crop boxes clamped to the frame. Pure; testable without video.
 
-    The side follows the swimmer's size (rolling median of box height over
-    `crop_size_smooth_s`, times `crop_scale`) so zoom is handled, while the median
-    keeps frame-to-frame jitter out. The center is a centered moving average. `scale`
-    is side / output video side; the output side is the 95th percentile of sides."""
+    The side follows the swimmer's size: a rolling median (over `crop_size_smooth_s`)
+    of the box's LONGER side, times `crop_scale`. Seen from the side a swimmer is a
+    long flat box, 2-3x wider than tall, and the recovery arm reaches beyond it; sizing
+    from the height alone gave head-and-shoulders crops with no limbs in them. The
+    median keeps frame-to-frame jitter out; the center is a centered moving average.
+    `scale` is side / output video side; the output side is the 95th percentile."""
     df = track_df.sort_values("frame").reset_index(drop=True)
     det = df[df["tracked"] == TRACKED_DETECTED]
     if det.empty:
         raise ValueError("no tracked frames; cannot size the crop")
     win_size = max(1, int(round(cfg.crop_size_smooth_s * fps)))
-    side = df["h"].rolling(win_size, center=True, min_periods=1).median() * cfg.crop_scale
-    side = np.clip(side.to_numpy(), cfg.crop_min_px, min(frame_w, frame_h))
+    long_side = np.maximum(df["w"].to_numpy(dtype=float), df["h"].to_numpy(dtype=float))
+    side = pd.Series(long_side).rolling(win_size, center=True, min_periods=1).median()
+    side = side.to_numpy() * cfg.crop_scale
+    frame_min = min(frame_w, frame_h)
+    side = np.minimum(np.maximum(side, cfg.crop_min_frac * frame_min), frame_min)
     side = (np.ceil(side / 2.0) * 2).astype(int)
     out_side = int(np.ceil(np.percentile(side, 95) / 2.0) * 2)
 

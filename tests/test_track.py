@@ -145,7 +145,7 @@ def test_crop_boxes_fixed_size_even_and_clamped():
     assert list(crops.columns) == CROP_COLUMNS
     assert crops["w"].nunique() == 1 and crops["h"].nunique() == 1
     side = int(crops["w"].iloc[0])
-    assert side == 32  # ceil(20 * 1.6) = 32, already even
+    assert side == 64  # the longer side (40) * 1.6, already even
     assert (crops["x0"] >= 0).all() and (crops["x0"] + side <= 320).all()
     assert (crops["y0"] >= 0).all() and (crops["y0"] + side <= 240).all()
     assert crops["x0"].iloc[0] == 0 and crops["x0"].iloc[-1] == 320 - side
