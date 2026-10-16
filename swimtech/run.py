@@ -14,6 +14,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from swimtech.types import RacePaths, Stroke
 
 log = logging.getLogger("swimtech")
@@ -174,13 +176,23 @@ def default_stages() -> dict[str, Callable[[RunOptions, RacePaths], None]]:
 
         motion = pd.read_parquet(p.motion) if p.motion.exists() else None
         n_frames = _count_frames(p.norm_video)
+        sel = resolve_selection(o, p)
+        lane = None
+        if sel.point is not None:
+            from swimtech.lanes import track_corridor
+
+            lane = track_corridor(
+                p.norm_video, load_water(p.water), motion, np.asarray(sel.point), sel.point_frame
+            )
+            lane.to_parquet(p.lane, index=False)
         t = track(
             det,
-            resolve_selection(o, p),
+            sel,
             fps,
             n_frames=n_frames,
             motion=motion,
             water=load_water(p.water),
+            lane=lane,
             frame_size=(int(probe["width"]), int(probe["height"])),
             lane_dir=_lane_dir_at(p.norm_video, o.swimmer_frame if o.swimmer_point else 0),
         )

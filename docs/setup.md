@@ -117,6 +117,29 @@ Re-running the same command reuses the slow detection step; only tracking repeat
 seconds. So trying a different `--swimmer` point is cheap. Add `--force` to redo
 everything.
 
+## 4b. Scoring the tracker with your own clicks (30 minutes per clip, once)
+
+A number beats an opinion. Mark where your swimmer is every two seconds, and every
+future tracker change gets scored against the same marks.
+
+```
+uv run swimtech mark race1          # writes data\race1.mark.html
+```
+
+Open that file in a browser. For each frame, click on your swimmer (anywhere on the
+body), or press **Not visible** when they are under water, hidden, or you cannot tell
+which one is them. Arrow keys move between frames; `n` is "not visible". Clicks are
+saved in the browser as you go. When all frames are marked, press **Download CSV** and
+move the downloaded `race1.truth.csv` into the `data` folder. Then:
+
+```
+uv run swimtech score race1
+```
+
+It prints one line per mark (on target, wrong target, lost, false box) and the totals.
+"On target" is the number that matters: the fraction of frames where the crop box the
+pose model will see contains your swimmer.
+
 ## 5. Secrets
 
 Copy `.env.example` to `.env` and fill it in. Nothing in this repo reads a secret from

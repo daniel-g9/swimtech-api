@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -114,6 +114,19 @@ class TrackConfig:
     )
     dedupe_iou: float = 0.7  # overlapping detector boxes above this IoU are merged
     water_min: float = 0.3  # a box must be at least this much on water to be a swimmer
+    # Corridor mode: there is only one swimmer in the lane, so a track may start from a
+    # weak box and survive a longer gap without risk of grabbing a lane-mate.
+    corridor_high_score: float = 0.15
+    corridor_lost_buffer_s: float = 2.0
+    corridor_max_height: float = 1.5  # box height over lane width; bigger is not a swimmer
+    corridor_max_width: float = 4.0  # box width over lane width
+    corridor_gate: float = 1.0  # search radius around the prediction, in lane widths...
+    corridor_gate_growth: float = 4.0  # ... growing by this many lane widths per second missing (scored on the truth clicks: 1.5 left clip 2 at 38%, 4.0 gives 77%)
+    corridor_gate_max: float = 6.0  # ... up to this
+    corridor_coast_s: float = 1.0  # velocity decays to zero over this long when missing
+    lane_margin: float = (
+        0.15  # corridor mode: boxes may sit this far outside the ropes (lane widths)
+    )
 
 
 # ----------------------------------------------------------------------------- tracker
@@ -305,6 +318,7 @@ def select_by_point(
     fps: float,
     cfg: TrackConfig = TrackConfig(),
     lane_dir: np.ndarray | None = None,
+    use_lane_axis: bool = True,
 ) -> list[_Track]:
     """Point mode. `lane_dir` (unit vector along the lane ropes, world coordinates)
     is the lane prior until the swimmer has moved far enough to define their own line.
@@ -368,7 +382,10 @@ def select_by_point(
         # has traced so far is a line along their lane. A re-acquired track must start
         # within half a lane of that line: lane-mates swim parallel, at the same speed,
         # and are otherwise indistinguishable from "the nearest swimmer heading our way".
-        lane_u, lane_pt, lane_h = _lane_axis(chain, lane_dir, point)
+        if use_lane_axis:
+            lane_u, lane_pt, lane_h = _lane_axis(chain, lane_dir, point)
+        else:
+            lane_u, lane_pt, lane_h = None, point, 1.0
         nxt: _Track | None = None
         nxt_cost = np.inf
         for t in tracks:
@@ -447,13 +464,18 @@ def track(
     water: np.ndarray | None = None,
     frame_size: tuple[int, int] | None = None,
     lane_dir: np.ndarray | None = None,
+    lane: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Detections (+ camera motion, + water mask) -> one dense per-frame track of the
     chosen swimmer in normalized-frame pixels: frame, cx, cy, w, h, score, tracked.
 
     `water`: (n_frames, gh, gw) uint8 grid from motion.estimate_water, with `frame_size`
     (w, h). Boxes that are mostly not on water (spectators, the deck, someone in front
-    of the lens) are dropped before tracking: swimmers are always in the water."""
+    of the lens) are dropped before tracking: swimmers are always in the water.
+
+    `lane`: the per-frame corridor from lanes.track_corridor. Boxes whose center is
+    outside the swimmer's lane are dropped too, so lane-mates never enter the tracker
+    and re-acquisition after a loss cannot pick one."""
     if n_frames is None:
         n_frames = int(det["frame"].max()) + 1 if len(det) else 0
     cum = (
@@ -479,6 +501,49 @@ def track(
         log.info("water filter: kept %d of %d boxes", int(keep.sum()), len(det))
         det = det[keep]
 
+    use_lane_axis = True
+    if lane is not None and len(lane) and len(det):
+        from swimtech.lanes import corridor_for_frame
+
+        keep = np.ones(len(det), dtype=bool)
+        for f, idx in det.groupby("frame").indices.items():
+            c = corridor_for_frame(lane, int(f))
+            if c is None:
+                continue
+            b = det.iloc[idx]
+            centers = np.column_stack([(b["x0"] + b["x1"]) / 2, (b["y0"] + b["y1"]) / 2])
+            # Box extent across and along the lane, in lane widths: a swimmer is never
+            # taller than the lane, so a head in front of the lens or a lifeguard chair
+            # whose center happens to fall in the corridor is rejected here.
+            nrm = c.normal()
+            tan = np.array([-nrm[1], nrm[0]])
+            corners = np.stack(
+                [
+                    np.column_stack([b["x0"], b["y0"]]),
+                    np.column_stack([b["x1"], b["y0"]]),
+                    np.column_stack([b["x0"], b["y1"]]),
+                    np.column_stack([b["x1"], b["y1"]]),
+                ]
+            )  # (4, k, 2)
+            across = (corners @ nrm).max(axis=0) - (corners @ nrm).min(axis=0)
+            along = (corners @ tan).max(axis=0) - (corners @ tan).min(axis=0)
+            w = max(c.width, 1.0)
+            keep[idx] = (
+                c.contains(centers, margin=cfg.lane_margin)
+                & (across <= cfg.corridor_max_height * w)
+                & (along <= cfg.corridor_max_width * w)
+            )
+        log.info("lane filter: kept %d of %d boxes", int(keep.sum()), len(det))
+        det = det[keep]
+        use_lane_axis = False  # the corridor already enforces the lane, drift-free
+        cfg = replace(
+            cfg, high_score=cfg.corridor_high_score, lost_buffer_s=cfg.corridor_lost_buffer_s
+        )
+        if sel.point is not None:
+            out = _track_in_corridor(det, lane, motion, sel, fps, n_frames, cfg)
+            out[["cx", "cy", "w", "h"]] = out[["cx", "cy", "w", "h"]].ffill().bfill()
+            return out
+
     # Everything below happens in world (frame-0) coordinates.
     detw = det.copy()
     if len(detw):
@@ -501,7 +566,9 @@ def track(
         tracker.update(boxes, f, seed=point_w if (point_w is not None and f == pf) else None)
 
     if point_w is not None:
-        chosen = select_by_point(tracker.tracks, point_w, pf, fps, cfg, lane_dir=lane_dir)
+        chosen = select_by_point(
+            tracker.tracks, point_w, pf, fps, cfg, lane_dir=lane_dir, use_lane_axis=use_lane_axis
+        )
     else:
         chosen = select_lane_tracks(tracker.tracks, sel.corridor(), cfg)
 
@@ -537,6 +604,208 @@ def track(
         out["cy"] = (bf[:, 1] + bf[:, 3]) / 2
         out["w"] = bf[:, 2] - bf[:, 0]
         out["h"] = bf[:, 3] - bf[:, 1]
+    return out
+
+
+def _track_in_corridor(
+    det: pd.DataFrame,
+    lane: pd.DataFrame,
+    motion: pd.DataFrame | None,
+    sel: SwimmerSelection,
+    fps: float,
+    n_frames: int,
+    cfg: TrackConfig,
+) -> pd.DataFrame:
+    """One swimmer in a corridor: follow them frame by frame.
+
+    Predict where the swimmer is from where they were, their own velocity, and the
+    camera motion since the last frame; take the best box near the prediction; when
+    none is near, coast (velocity decaying to zero, as at a wall) and widen the search
+    the longer they have been missing. Runs forward from the tap frame, then backward.
+    Lane-mates cannot be picked because they are not in `det` any more; the rest is a
+    tie between the swimmer and their own splash, which the crop absorbs.
+
+    Works in each frame's own pixels: only the frame-to-frame camera motion is used,
+    so cumulative drift never enters."""
+    from swimtech.lanes import corridor_for_frame
+    from swimtech.motion import _as_matrix
+
+    steps: dict[int, np.ndarray] = {}
+    if motion is not None and len(motion):
+        for _, r in motion.iterrows():
+            steps[int(r["frame"])] = _as_matrix(r["a"], r["b"], r["tx"], r["ty"])
+    by_frame = (
+        {
+            int(f): g[["x0", "y0", "x1", "y1", "score"]].to_numpy(dtype=float)
+            for f, g in det.groupby("frame")
+        }
+        if len(det)
+        else {}
+    )
+    out = pd.DataFrame(
+        {
+            "frame": np.arange(n_frames, dtype=int),
+            "cx": np.nan,
+            "cy": np.nan,
+            "w": np.nan,
+            "h": np.nan,
+            "score": 0.0,
+            "tracked": TRACKED_HELD,
+        }
+    )
+    pf = min(max(int(sel.point_frame), 0), max(n_frames - 1, 0))
+    point = np.asarray(sel.point, dtype=float)
+    frame_wh = (
+        np.array([det["x1"].max(), det["y1"].max()], dtype=float)
+        if len(det)
+        else np.array([1e9, 1e9])
+    )
+
+    def lane_width(f: int) -> float:
+        c = corridor_for_frame(lane, f)
+        return max(c.width, 1.0) if c is not None else 100.0
+
+    def pick2(f: int, pred_w: np.ndarray, pred_s: np.ndarray, gate: float, size: float | None):
+        boxes = dedupe_boxes(by_frame.get(f, np.zeros((0, 5))), cfg.dedupe_iou)
+        if len(boxes) == 0:
+            return None
+        centers = (boxes[:, :2] + boxes[:, 2:4]) / 2
+        d = (
+            np.minimum(
+                np.linalg.norm(centers - pred_w, axis=1), np.linalg.norm(centers - pred_s, axis=1)
+            )
+            / gate
+        )
+        cost = d - 0.5 * boxes[:, 4]
+        if size is not None:
+            sz = np.maximum(boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1])
+            cost += 0.3 * np.abs(np.log(np.maximum(sz, 1.0) / size))
+        ok = d <= 1.0
+        if not ok.any():
+            return None
+        return boxes[int(np.argmin(np.where(ok, cost, np.inf)))]
+
+    def pick(f: int, pred: np.ndarray, gate: float, size: float | None):
+        boxes = dedupe_boxes(by_frame.get(f, np.zeros((0, 5))), cfg.dedupe_iou)
+        if len(boxes) == 0:
+            return None
+        centers = (boxes[:, :2] + boxes[:, 2:4]) / 2
+        d = np.linalg.norm(centers - pred, axis=1) / gate
+        cost = d - 0.5 * boxes[:, 4]
+        if size is not None:
+            sz = np.maximum(boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1])
+            cost += 0.3 * np.abs(np.log(np.maximum(sz, 1.0) / size))
+        ok = d <= 1.0
+        if not ok.any():
+            return None
+        i = int(np.argmin(np.where(ok, cost, np.inf)))
+        return boxes[i]
+
+    def start_box():
+        """The box under the tap, or the nearest box within a lane width on frames
+        around the tap frame (the swimmer may not be detected on that exact frame)."""
+        for radius in range(0, int(fps * 3)):
+            for f in {pf + radius, pf - radius}:
+                if not (0 <= f < n_frames):
+                    continue
+                boxes = dedupe_boxes(by_frame.get(f, np.zeros((0, 5))), cfg.dedupe_iou)
+                if len(boxes) == 0:
+                    continue
+                under = (
+                    (boxes[:, 0] <= point[0])
+                    & (point[0] <= boxes[:, 2])
+                    & (boxes[:, 1] <= point[1])
+                    & (point[1] <= boxes[:, 3])
+                )
+                if under.any():
+                    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                    return f, boxes[int(np.flatnonzero(under)[np.argmin(areas[under])])]
+                centers = (boxes[:, :2] + boxes[:, 2:4]) / 2
+                d = np.linalg.norm(centers - point, axis=1)
+                if d.min() <= lane_width(f):
+                    return f, boxes[int(np.argmin(d))]
+        return None, None
+
+    f0, b0 = start_box()
+    if b0 is None:
+        log.warning("corridor tracker: no box near the tapped point; nothing to crop")
+        return out
+
+    def write(f: int, b: np.ndarray) -> None:
+        out.loc[f, ["cx", "cy", "w", "h", "score", "tracked"]] = [
+            (b[0] + b[2]) / 2,
+            (b[1] + b[3]) / 2,
+            b[2] - b[0],
+            b[3] - b[1],
+            b[4],
+            TRACKED_DETECTED,
+        ]
+
+    def sweep(frames: range, forward: bool) -> None:
+        # Two hypotheses about where a missing swimmer is: fixed in the world (the
+        # camera panned, they stayed put: pos follows the camera motion) and fixed on
+        # screen (the camera is following them: pos stays). A handheld camera at a meet
+        # does both, so a box near either prediction counts, and while they are missing
+        # neither prediction is allowed to run off the frame.
+        pos_w = (b0[:2] + b0[2:4]) / 2  # world-static hypothesis, in current pixels
+        pos_s = pos_w.copy()  # screen-static hypothesis
+        vel = np.zeros(2)  # on-screen velocity while tracked
+        size = float(max(b0[2] - b0[0], b0[3] - b0[1]))
+        missing = 0
+        prev = f0
+        for f in frames:
+            m = steps.get(f if forward else prev, np.eye(3))
+            if not forward:
+                m = np.linalg.inv(m)
+            lin = m[:2, :2]
+            pos_w = lin @ pos_w + m[:2, 2]
+            w = lane_width(f)
+            vcap = 0.25 * w
+            if np.linalg.norm(vel) > vcap:
+                vel = vel / np.linalg.norm(vel) * vcap
+            pred_w = pos_w + vel
+            pred_s = pos_s + vel
+            gate = (
+                min(
+                    cfg.corridor_gate + cfg.corridor_gate_growth * missing / fps,
+                    cfg.corridor_gate_max,
+                )
+                * w
+            )
+            b = pick2(f, pred_w, pred_s, gate, size)
+            if b is not None:
+                c = (b[:2] + b[2:4]) / 2
+                step_v = c - pos_s
+                vel = 0.6 * vel + 0.4 * step_v if missing == 0 else step_v / (missing + 1)
+                pos_w = c
+                pos_s = c
+                size = 0.9 * size + 0.1 * float(max(b[2] - b[0], b[3] - b[1]))
+                missing = 0
+                write(f, b)
+            else:
+                missing += 1
+                vel *= max(0.0, 1.0 - 1.0 / max(cfg.corridor_coast_s * fps, 1.0))
+                pos_w = np.clip(pos_w + vel, 0, frame_wh)
+                pos_s = np.clip(pos_s + vel, 0, frame_wh)
+                # While missing, the box follows the screen-static prediction: a camera
+                # at a meet is following the swimmer, so where they were on screen is
+                # the best guess (linear interpolation between two detections a second
+                # apart was measured to land 2-5 lane widths off during a pan).
+                out.loc[f, ["cx", "cy", "w", "h", "score", "tracked"]] = [
+                    pos_s[0],
+                    pos_s[1],
+                    size,
+                    size,
+                    0.0,
+                    TRACKED_INTERP if missing <= cfg.max_gap_s * fps else TRACKED_HELD,
+                ]
+            prev = f
+
+    write(f0, b0)
+    sweep(range(f0 + 1, n_frames), forward=True)
+    sweep(range(f0 - 1, -1, -1), forward=False)
+    n_det = int((out["tracked"] == TRACKED_DETECTED).sum())
+    log.info("corridor tracker: swimmer detected on %d of %d frames", n_det, n_frames)
     return out
 
 

@@ -183,6 +183,61 @@ def preview(
 
 
 @app.command()
+def mark(
+    race_id: str = typer.Argument(..., help="A race that has been ingested"),
+    work_dir: Path = typer.Option(Path("data")),
+    every: float = typer.Option(2.0, help="Seconds between frames to mark"),
+) -> None:
+    """Write data/<race_id>.mark.html: open it in a browser, click your swimmer on each
+    frame, download the CSV, save it as data/<race_id>.truth.csv, then `swimtech score`."""
+    from swimtech.truth import write_mark_page
+    from swimtech.types import RacePaths
+
+    paths = RacePaths(work_dir=work_dir, race_id=race_id)
+    if not paths.norm_video.exists():
+        raise typer.BadParameter(f"{paths.norm_video} not found; run `swimtech ingest` first")
+    out = paths.work_dir / f"{race_id}.mark.html"
+    n = write_mark_page(paths.norm_video, out, race_id, every_s=every)
+    typer.echo(f"wrote {out} with {n} frames; open it in a browser")
+
+
+@app.command()
+def score(
+    race_id: str = typer.Argument(..., help="A race run to the track stage, with a truth CSV"),
+    work_dir: Path = typer.Option(Path("data")),
+    truth: Path | None = typer.Option(None, help="Default: data/<race_id>.truth.csv"),
+) -> None:
+    """Score the tracked crop against the clicks from `swimtech mark`."""
+    import json
+
+    import pandas as pd
+
+    from swimtech.truth import load_truth
+    from swimtech.truth import score as _score
+    from swimtech.types import RacePaths
+
+    paths = RacePaths(work_dir=work_dir, race_id=race_id)
+    truth_path = truth or (paths.work_dir / f"{race_id}.truth.csv")
+    if not truth_path.exists():
+        raise typer.BadParameter(f"{truth_path} not found; download it from the mark page")
+    if not paths.crop_offsets.exists():
+        raise typer.BadParameter(
+            f"{paths.crop_offsets} not found; run `swimtech run ... --to track`"
+        )
+    fps = float(json.loads(paths.probe_json.read_text())["target_fps"])
+    summary, table = _score(pd.read_parquet(paths.crop_offsets), load_truth(truth_path), fps)
+    for _, r in table.iterrows():
+        typer.echo(f"{r['sec']:6.1f}s  {r['verdict']}")
+    typer.echo("")
+    typer.echo(
+        f"on target {summary['on_target']:.0%}   wrong target {summary['wrong_target']:.0%}   "
+        f"lost while visible {summary['lost_while_visible']:.0%}   "
+        f"({summary['visible_marks']} visible marks of {summary['marks']}; "
+        f"{summary['false_box']} boxes shown while not visible)"
+    )
+
+
+@app.command()
 def metrics() -> None:
     """List the metric registry (docs/metrics.md)."""
     from swimtech.metrics.registry import REGISTRY

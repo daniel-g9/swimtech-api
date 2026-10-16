@@ -129,6 +129,10 @@ class RacePaths:
         return self._p("water.npz")
 
     @property
+    def lane(self) -> Path:
+        return self._p("lane.parquet")
+
+    @property
     def detections(self) -> Path:
         return self._p("det.parquet")
 

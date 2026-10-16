@@ -66,6 +66,7 @@ extend-immutable-calls = [
 
 [tool.ruff.lint.per-file-ignores]
 "swimtech/calib.py" = ["N806"]  # H is the conventional name for a homography
+"swimtech/truth.py" = ["E501"]  # embedded HTML/JS template
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

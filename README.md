@@ -42,7 +42,7 @@ samples/           sample.results.json for the Vue app to build against
 | 1 | 1.1 ingest | done, tested with a synthetic clip |
 | 1 | 1.2 quality | done, tested |
 | 1 | 1.3 detector | done; on real footage swimmers score low (~0.25) and spectators high, so Stage 3 fine-tuning is likely |
-| 1 | 1.4 motion + tracker + crop | done; moving camera supported; tested on synthetic pans/zooms and two real clips |
+| 1 | 1.4 motion + lane corridor + tracker + crop | done; moving camera supported; scored on the user's clicks: 96% and 77% on target (docs/handoff.md) |
 | 1 | 1.5 calibration | done, tested; unusable with a moving camera, so `_rect` metrics are deferred |
 | 1 | 1.6 run on one clip | in progress with real clips; see `docs/setup.md` section 4 |
 | 2 | 2.2 smoothing | stage function done; wiring lands with 2.1 |
